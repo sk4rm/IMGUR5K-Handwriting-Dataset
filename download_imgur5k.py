@@ -43,6 +43,13 @@ def parse_args():
         required=False,
         help="Directory path to download the image",
     )
+    parser.add_argument(
+        "--imgur_client_id",
+        type=str,
+        default="",
+        required=True,
+        help="Create one here: https://api.imgur.com/oauth2/addclient",
+    )
     args = parser.parse_args()
     return args
 
@@ -50,6 +57,7 @@ def parse_args():
 # Image hash computed for image using md5..
 def compute_image_hash(img_path):
     return hashlib.md5(open(img_path, 'rb').read()).hexdigest()
+
 
 # Create a sub json based on split idx
 def _create_split_json(anno_json, _split_idx):
@@ -73,6 +81,46 @@ def _create_split_json(anno_json, _split_idx):
 
     return split_json
 
+
+# Returns direct URL to image with given hash or empty string if unsuccessful
+def fetch_image_url(image_hash, imgur_client_id):
+    '''
+    Returns direct URL to image with given hash or empty string if unsuccessful
+    '''
+
+    imgur_api_url = f'https://api.imgur.com/3/image/{image_hash}'
+
+    api_response = requests.get(imgur_api_url, headers={'Authorization': f'Client-ID {imgur_client_id}'})
+    if not api_response.ok:
+        if api_response.status_code == 404:
+            print(f"Image doesn't exist anymore (404 not found)")
+        else:
+            print(f"Unexpected status code: {api_response.status_code}\n")
+        return ''
+    
+    response_data = api_response.json()['data']
+
+    # We have to fix direct link to i.imgur.com because the link from API doesn't work smh:
+
+    # e.g. If the image file ends with ,jpeg, the API will give .jpg instead and it won't work.
+    image_type = response_data['type'].split('/')[1] # e.g. 'image/jpeg' -> 'jpeg'
+
+    # e.g. 'https://i.imgur.com/ABCDEF.jpg', 'image/jpeg' -> 'https://i.imgur.com/ABCDEF.jpeg'
+    image_url = '.'.join(response_data['link'].split('.')[:-1]) + '.' + image_type
+
+    return image_url
+
+
+def invalidate_url(image_hash, invalid_urls):
+    '''
+    I don't really want to mess with the URLs in the .lst file, so I'm just going
+    to reuse the faulty `i.imgur.com/<hash>.jpg` links
+    '''
+    
+    url = f'https://i.imgur.com/{image_hash}.jpg'
+    invalid_urls.append(url)
+
+
 def main():
     args = parse_args()
     os.makedirs(args.output_dir, exist_ok=True)
@@ -85,27 +133,36 @@ def main():
         for hash in hashes:
             hash_dict[f"{hash.split()[0]}"] = f"{hash.split()[1]}"
 
-
     tot_evals = 0
     num_match = 0
     invalid_urls = []
     # Download the urls and save only the ones with valid hash o ensure underlying image has not changed
     for index in list(hash_dict.keys()):
-        image_url = f'https://i.imgur.com/{index}.jpg'
-        img_data = requests.get(image_url).content
+        image_url = fetch_image_url(index, args.imgur_client_id)
+        if image_url == '':
+            continue
+
+        # e.g. 'https://i.imgur.com/ABCDEF.jpeg' -> 'jpeg'
+        image_type = image_url.split('.')[-1]
+
+        print(image_url, image_type, invalid_urls)
+
+        # User-Agent required otherwise 429
+        img_data = requests.get(image_url, headers={'User-Agent': f'my bot 1.0'}).content
+        
         if len(img_data) < 100:
             print(f"URL retrieval for {index} failed!!\n")
-            invalid_urls.append(image_url)
+            invalidate_url(index, invalid_urls)
             continue
-        with open(f'{args.output_dir}/{index}.jpg', 'wb') as handler:
+        with open(f'{args.output_dir}/{index}.{image_type}', 'wb') as handler:
             handler.write(img_data)
 
-        compute_image_hash(f'{args.output_dir}/{index}.jpg')
+        compute_image_hash(f'{args.output_dir}/{index}.{image_type}')
         tot_evals += 1
-        if hash_dict[index] != compute_image_hash(f'{args.output_dir}/{index}.jpg'):
-            print(f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {compute_image_hash(f'{args.output_dir}/{index}.jpg')}")
-            os.remove(f'{args.output_dir}/{index}.jpg')
-            invalid_urls.append(image_url)
+        if hash_dict[index] != compute_image_hash(f'{args.output_dir}/{index}.{image_type}'):
+            print(f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {compute_image_hash(f'{args.output_dir}/{index}.{image_type}')}")
+            os.remove(f'{args.output_dir}/{index}.{image_type}')
+            invalidate_url(index, invalid_urls)
             continue
         else:
             num_match += 1
@@ -147,6 +204,7 @@ def main():
         json.dump(split_json, open(f'{args.dataset_info_dir}/imgur5k_annotations_{split}.json', 'w'), indent=4)
 
     print(f"MATCHES: {num_match}/{tot_evals}\n")
+
 
 if __name__ == '__main__':
     main()

@@ -91,8 +91,8 @@ def main():
     invalid_urls = []
     # Download the urls and save only the ones with valid hash o ensure underlying image has not changed
     for index in list(hash_dict.keys()):
-        image_url = f'https://i.imgur.com/{index}.jpg'
-        img_data = requests.get(image_url).content
+        image_url = f'https://i.imgur.com/{index}.jpeg'
+        img_data = requests.get(image_url, headers={'User-Agent': f'my bot 2.0'}).content
         if len(img_data) < 100:
             print(f"URL retrieval for {index} failed!!\n")
             invalid_urls.append(image_url)

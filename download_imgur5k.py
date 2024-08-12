@@ -21,11 +21,13 @@ Output:
 import argparse
 import hashlib
 import json
-import numpy as np
+import multiprocessing as mp
 import os
+from concurrent import futures
+
+import numpy as np
 import requests
 
-from PIL import Image
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Processing imgur5K dataset download...")
@@ -43,13 +45,6 @@ def parse_args():
         required=False,
         help="Directory path to download the image",
     )
-    parser.add_argument(
-        "--imgur_client_id",
-        type=str,
-        default="",
-        required=True,
-        help="Create one here: https://api.imgur.com/oauth2/addclient",
-    )
     args = parser.parse_args()
     return args
 
@@ -61,7 +56,6 @@ def compute_image_hash(img_path):
 
 # Create a sub json based on split idx
 def _create_split_json(anno_json, _split_idx):
-
     split_json = {}
 
     split_json['index_id'] = {}
@@ -82,43 +76,47 @@ def _create_split_json(anno_json, _split_idx):
     return split_json
 
 
-# Returns direct URL to image with given hash or empty string if unsuccessful
-def fetch_image_url(image_hash, imgur_client_id):
-    '''
-    Returns direct URL to image with given hash or empty string if unsuccessful
-    '''
+def partial_func(task_args):
+    """
+    Partial function for retrieving and saving image content.
 
-    imgur_api_url = f'https://api.imgur.com/3/image/{image_hash}'
+    Image content is comparing against the expected hash.
+    If image is invalid, or hash does not match, invalid url will be returned.
+    :param: task_args tuple containing index, hash_dict, output_dir
+    :return: invalid_url or None
+    """
+    index, hash_dict, output_dir = task_args
 
-    api_response = requests.get(imgur_api_url, headers={'Authorization': f'Client-ID {imgur_client_id}'})
-    if not api_response.ok:
-        if api_response.status_code == 404:
-            print(f"Image doesn't exist anymore (404 not found)")
-        else:
-            print(f"Unexpected status code: {api_response.status_code}\n")
-        return ''
-    
-    response_data = api_response.json()['data']
+    image_url = f'https://i.imgur.com/{index}.jpg'
+    user_agent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:129.0) Gecko/20100101 Firefox/129.0'
+    headers = {'User-Agent': user_agent}
+    filename = f'{output_dir}/{index}.jpg'
 
-    # We have to fix direct link to i.imgur.com because the link from API doesn't work smh:
+    # Only download if file doesn't exist
+    if not os.path.isfile(filename):
+        # Download
+        img_data = requests.get(image_url, headers=headers).content
 
-    # e.g. If the image file ends with ,jpeg, the API will give .jpg instead and it won't work.
-    image_type = response_data['type'].split('/')[1] # e.g. 'image/jpeg' -> 'jpeg'
+        # Check
+        if len(img_data) < 100:
+            print(f"URL retrieval for {index} failed!!\n")
+            return image_url
 
-    # e.g. 'https://i.imgur.com/ABCDEF.jpg', 'image/jpeg' -> 'https://i.imgur.com/ABCDEF.jpeg'
-    image_url = '.'.join(response_data['link'].split('.')[:-1]) + '.' + image_type
+        # Save
+        with open(filename, 'wb') as handler:
+            handler.write(img_data)
+    else:
+        print(f'{filename} already exists. Skipping...')
 
-    return image_url
+    # Verify image integrity
+    image_hash = compute_image_hash(filename)
+    if hash_dict[index] != image_hash:
+        print(
+            f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {image_hash}")
+        os.remove(filename)
+        return image_url
 
-
-def invalidate_url(image_hash, invalid_urls):
-    '''
-    I don't really want to mess with the URLs in the .lst file, so I'm just going
-    to reuse the faulty `i.imgur.com/<hash>.jpg` links
-    '''
-    
-    url = f'https://i.imgur.com/{image_hash}.jpg'
-    invalid_urls.append(url)
+    return None
 
 
 def main():
@@ -135,62 +133,40 @@ def main():
 
     tot_evals = 0
     num_match = 0
-    invalid_urls = []
+
+    executor = futures.ThreadPoolExecutor(max(mp.cpu_count() - 1, 1))
     # Download the urls and save only the ones with valid hash o ensure underlying image has not changed
-    for index in list(hash_dict.keys()):
-        image_url = fetch_image_url(index, args.imgur_client_id)
-        if image_url == '':
-            continue
+    invalid_urls = list(
+        executor.map(partial_func, [(key, hash_dict, args.output_dir) for key in list(hash_dict.keys())]))
 
-        # e.g. 'https://i.imgur.com/ABCDEF.jpeg' -> 'jpeg'
-        image_type = image_url.split('.')[-1]
-
-        print(image_url, image_type, invalid_urls)
-
-        # User-Agent required otherwise 429
-        img_data = requests.get(image_url, headers={'User-Agent': f'my bot 1.0'}).content
-        
-        if len(img_data) < 100:
-            print(f"URL retrieval for {index} failed!!\n")
-            invalidate_url(index, invalid_urls)
-            continue
-        with open(f'{args.output_dir}/{index}.{image_type}', 'wb') as handler:
-            handler.write(img_data)
-
-        compute_image_hash(f'{args.output_dir}/{index}.{image_type}')
+    for result in invalid_urls:
         tot_evals += 1
-        if hash_dict[index] != compute_image_hash(f'{args.output_dir}/{index}.{image_type}'):
-            print(f"For IMG: {index}, ref hash: {hash_dict[index]} != cur hash: {compute_image_hash(f'{args.output_dir}/{index}.{image_type}')}")
-            os.remove(f'{args.output_dir}/{index}.{image_type}')
-            invalidate_url(index, invalid_urls)
-            continue
-        else:
+        if result is None:
             num_match += 1
 
+    print("Download completed! Annotating...")
+
     # Generate the final annotations file
-    # Format: { "index_id" : {indexes}, "index_to_annotation_map" : { annotations ids for an index}, "annotation_id": { each annotation's info } }
+    # Format: { "index_id" : {indexes}, "index_to_ann_map" : { annotations ids for an index}, "ann_id": { each annotation's info } }
     # Bounding boxes with '.' mean the annotations were not done for various reasons
 
-    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=np.str, encoding="utf-8")
-    anno_json = {}
-
-    anno_json['index_id'] = {}
-    anno_json['index_to_ann_map'] = {}
-    anno_json['ann_id'] = {}
+    _F = np.loadtxt(f'{args.dataset_info_dir}/imgur5k_data.lst', delimiter="\t", dtype=str, encoding="utf-8")
+    anno_json = {'index_id': {}, 'index_to_ann_map': {}, 'ann_id': {}}
 
     cur_index = ''
-    for cnt, image_url in enumerate(_F[:,0]):
+    for cnt, image_url in enumerate(_F[:, 0]):
         if image_url in invalid_urls:
             continue
 
         index = image_url.split('/')[-1][:-4]
         if index != cur_index:
-            anno_json['index_id'][index] = {'image_url': image_url, 'image_path': f'{args.output_dir}/{index}.jpg', 'image_hash': hash_dict[index]}
+            anno_json['index_id'][index] = {'image_url': image_url, 'image_path': f'{args.output_dir}/{index}.jpg',
+                                            'image_hash': hash_dict[index]}
             anno_json['index_to_ann_map'][index] = []
 
         ann_id = f"{index}_{len(anno_json['index_to_ann_map'][index])}"
         anno_json['index_to_ann_map'][index].append(ann_id)
-        anno_json['ann_id'][ann_id] = {'word': _F[cnt,2], 'bounding_box': _F[cnt,1]}
+        anno_json['ann_id'][ann_id] = {'word': _F[cnt, 2], 'bounding_box': _F[cnt, 1]}
 
         cur_index = index
 
@@ -199,7 +175,7 @@ def main():
     # Now split the annotations json in train, validation and test jsons
     splits = ['train', 'val', 'test']
     for split in splits:
-        _split_idx = np.loadtxt(f'{args.dataset_info_dir}/{split}_index_ids.lst', delimiter="\n", dtype=np.str)
+        _split_idx = np.loadtxt(f'{args.dataset_info_dir}/{split}_index_ids.lst', dtype=str)
         split_json = _create_split_json(anno_json, _split_idx)
         json.dump(split_json, open(f'{args.dataset_info_dir}/imgur5k_annotations_{split}.json', 'w'), indent=4)
 
